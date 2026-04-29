@@ -11,6 +11,7 @@ import "./interfaces/IOHM.sol";
 import "./interfaces/IsOHM.sol";
 import "./interfaces/IBondingCalculator.sol";
 import "./interfaces/ITreasury.sol";
+import "./interfaces/IERC721Minimal.sol";
 
 import "./types/OlympusAccessControlled.sol";
 
@@ -23,6 +24,9 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
     /* ========== EVENTS ========== */
 
     event Deposit(address indexed token, uint256 amount, uint256 value);
+    event DepositPosition(address indexed positionManager, uint256 indexed tokenId, uint256 value);
+    event WithdrawalPosition(address indexed positionManager, uint256 indexed tokenId, uint256 value);
+    event ManagedPosition(address indexed positionManager, uint256 indexed tokenId);
     event Withdrawal(address indexed token, uint256 amount, uint256 value);
     event CreateDebt(address indexed debtor, address indexed token, uint256 amount, uint256 value);
     event RepayDebt(address indexed debtor, address indexed token, uint256 amount, uint256 value);
@@ -45,7 +49,10 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
         RESERVEDEBTOR,
         REWARDMANAGER,
         SOHM,
-        OHMDEBTOR
+        OHMDEBTOR,
+        // V4 LP custody: `_address` is the canonical PositionManager (ERC721),
+        // not a fungible LP token. Wired with a UniswapV4BondingCalculator.
+        LIQUIDITYNFT
     }
 
     struct Queue {
@@ -67,6 +74,16 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
     mapping(address => address) public bondCalculator;
 
     mapping(address => uint256) public debtLimit;
+
+    // V4 LP custody:
+    //   heldPositions[positionManager]                 -> list of tokenIds held
+    //   heldPositionIndexPlusOne[positionManager][id]  -> 0 means not held,
+    //                                                     otherwise index+1 in heldPositions
+    //   bookedPositionValue[positionManager][id]       -> OHM value credited at deposit time;
+    //                                                     re-checked by auditReserves
+    mapping(address => uint256[]) public heldPositions;
+    mapping(address => mapping(uint256 => uint256)) public heldPositionIndexPlusOne;
+    mapping(address => mapping(uint256 => uint256)) public bookedPositionValue;
 
     uint256 public totalReserves;
     uint256 public totalDebt;
@@ -172,6 +189,103 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
         IERC20(_token).safeTransfer(msg.sender, _amount);
         emit Managed(_token, _amount);
     }
+
+    /* ========== V4 LP (ERC721) FUNCTIONS ========== */
+
+    /**
+     * @notice Deposit a Uniswap V4 position NFT for OHM. Mirrors `deposit` for ERC20 LP.
+     * @dev    Uses LIQUIDITYDEPOSITOR permission, same as v2 LP deposits, so existing
+     *         bond depositors don't need a new role. The calculator at
+     *         `bondCalculator[positionManager]` MUST implement IBondingCalculator and
+     *         interpret its second arg as `tokenId` (see UniswapV4BondingCalculator).
+     */
+    function depositPosition(
+        address _positionManager,
+        uint256 _tokenId,
+        uint256 _profit
+    ) external returns (uint256 send_) {
+        require(permissions[STATUS.LIQUIDITYNFT][_positionManager], notAccepted);
+        require(permissions[STATUS.LIQUIDITYDEPOSITOR][msg.sender], notApproved);
+
+        IERC721Minimal(_positionManager).safeTransferFrom(msg.sender, address(this), _tokenId);
+        _trackPosition(_positionManager, _tokenId);
+
+        uint256 value = IBondingCalculator(bondCalculator[_positionManager]).valuation(_positionManager, _tokenId);
+        require(value != 0, invalidToken);
+
+        bookedPositionValue[_positionManager][_tokenId] = value;
+
+        send_ = value.sub(_profit);
+        OHM.mint(msg.sender, send_);
+
+        totalReserves = totalReserves.add(value);
+        emit DepositPosition(_positionManager, _tokenId, value);
+    }
+
+    /**
+     * @notice Burn OHM equal to the booked value of a held v4 position to reclaim the NFT.
+     * @dev    LIQUIDITYMANAGER permission, paralleling withdraw's RESERVESPENDER but for LP.
+     *         We use the *booked* value (not a re-quote) so the redeemer can't game TWAP swings.
+     */
+    function withdrawPosition(address _positionManager, uint256 _tokenId) external {
+        require(permissions[STATUS.LIQUIDITYMANAGER][msg.sender], notApproved);
+        require(heldPositionIndexPlusOne[_positionManager][_tokenId] != 0, notAccepted);
+
+        uint256 value = bookedPositionValue[_positionManager][_tokenId];
+        OHM.burnFrom(msg.sender, value);
+        totalReserves = totalReserves.sub(value);
+
+        _untrackPosition(_positionManager, _tokenId);
+        delete bookedPositionValue[_positionManager][_tokenId];
+
+        IERC721Minimal(_positionManager).safeTransferFrom(address(this), msg.sender, _tokenId);
+        emit WithdrawalPosition(_positionManager, _tokenId, value);
+    }
+
+    /**
+     * @notice Send a held v4 position NFT out under LIQUIDITYMANAGER, deducting its
+     *         booked value from totalReserves. Parallels `manage` for LP tokens.
+     */
+    function managePosition(address _positionManager, uint256 _tokenId) external {
+        require(permissions[STATUS.LIQUIDITYMANAGER][msg.sender], notApproved);
+        require(heldPositionIndexPlusOne[_positionManager][_tokenId] != 0, notAccepted);
+
+        uint256 value = bookedPositionValue[_positionManager][_tokenId];
+        require(value <= excessReserves(), insufficientReserves);
+        totalReserves = totalReserves.sub(value);
+
+        _untrackPosition(_positionManager, _tokenId);
+        delete bookedPositionValue[_positionManager][_tokenId];
+
+        IERC721Minimal(_positionManager).safeTransferFrom(address(this), msg.sender, _tokenId);
+        emit ManagedPosition(_positionManager, _tokenId);
+    }
+
+    /// @notice ERC721 receiver hook — accept all safeTransferFrom into the Treasury.
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    function _trackPosition(address _positionManager, uint256 _tokenId) internal {
+        require(heldPositionIndexPlusOne[_positionManager][_tokenId] == 0, "Treasury: already held");
+        heldPositions[_positionManager].push(_tokenId);
+        heldPositionIndexPlusOne[_positionManager][_tokenId] = heldPositions[_positionManager].length;
+    }
+
+    function _untrackPosition(address _positionManager, uint256 _tokenId) internal {
+        uint256 indexPlusOne = heldPositionIndexPlusOne[_positionManager][_tokenId];
+        uint256 lastIndex = heldPositions[_positionManager].length - 1;
+        uint256 index = indexPlusOne - 1;
+        if (index != lastIndex) {
+            uint256 lastId = heldPositions[_positionManager][lastIndex];
+            heldPositions[_positionManager][index] = lastId;
+            heldPositionIndexPlusOne[_positionManager][lastId] = indexPlusOne;
+        }
+        heldPositions[_positionManager].pop();
+        delete heldPositionIndexPlusOne[_positionManager][_tokenId];
+    }
+
+    /* ========== END V4 LP FUNCTIONS ========== */
 
     /**
      * @notice mint new OHM using excess reserves
@@ -280,6 +394,18 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
                 );
             }
         }
+        // Re-value every held v4 position NFT and update booked value.
+        address[] memory liquidityNFT = registry[STATUS.LIQUIDITYNFT];
+        for (uint256 i = 0; i < liquidityNFT.length; i++) {
+            address pm = liquidityNFT[i];
+            if (!permissions[STATUS.LIQUIDITYNFT][pm]) continue;
+            uint256[] memory ids = heldPositions[pm];
+            for (uint256 j = 0; j < ids.length; j++) {
+                uint256 v = IBondingCalculator(bondCalculator[pm]).valuation(pm, ids[j]);
+                bookedPositionValue[pm][ids[j]] = v;
+                reserves = reserves.add(v);
+            }
+        }
         totalReserves = reserves;
         emit ReservesAudited(reserves);
     }
@@ -310,7 +436,7 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
         } else {
             permissions[_status][_address] = true;
 
-            if (_status == STATUS.LIQUIDITYTOKEN) {
+            if (_status == STATUS.LIQUIDITYTOKEN || _status == STATUS.LIQUIDITYNFT) {
                 bondCalculator[_address] = _calculator;
             }
 
@@ -408,7 +534,7 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
         } else {
             permissions[info.managing][info.toPermit] = true;
 
-            if (info.managing == STATUS.LIQUIDITYTOKEN) {
+            if (info.managing == STATUS.LIQUIDITYTOKEN || info.managing == STATUS.LIQUIDITYNFT) {
                 bondCalculator[info.toPermit] = info.calculator;
             }
             (bool registered, ) = indexInRegistry(info.toPermit, info.managing);
@@ -483,6 +609,21 @@ contract OlympusTreasury is OlympusAccessControlled, ITreasury {
         if (permissions[STATUS.LIQUIDITYTOKEN][_token]) {
             value_ = IBondingCalculator(bondCalculator[_token]).valuation(_token, _amount);
         }
+    }
+
+    /**
+     * @notice live OHM valuation of a v4 position NFT (calculator re-quote, not booked).
+     * @param  _positionManager address registered as LIQUIDITYNFT
+     * @param  _tokenId         position id
+     */
+    function positionValue(address _positionManager, uint256 _tokenId) public view returns (uint256) {
+        require(permissions[STATUS.LIQUIDITYNFT][_positionManager], notAccepted);
+        return IBondingCalculator(bondCalculator[_positionManager]).valuation(_positionManager, _tokenId);
+    }
+
+    /// @notice tokenIds the Treasury currently holds for a given PositionManager.
+    function heldPositionIds(address _positionManager) external view returns (uint256[] memory) {
+        return heldPositions[_positionManager];
     }
 
     /**
